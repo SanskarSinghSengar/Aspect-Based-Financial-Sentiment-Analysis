@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""
+train_hybrid.py
+
+Train the Hybrid FinBERT + GRU + Multi-Head Attention + Topic model.
+
+Pipeline:
+  - Load train/test splits + precomputed topic distributions.
+  - Fit StandardScaler on topics.
+  - Tokenize with FinBERT tokenizer.
+  - Build HybridTokenDataset and DataLoaders.
+  - Train HybridFinModel using Focal Loss (class-weighted).
+  - Save best model (.pth) + meta JSON + encodings for reuse.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import joblib
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from sklearn.metrics import (
+    f1_score,
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+)
+from sklearn.preprocessing import StandardScaler
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from transformers import get_linear_schedule_with_warmup
+
+from .config import (
+    ARTIFACTS_DIR,
+    TRAIN_TEST_JOBLIB,
+    TRAIN_TOPICS_RAW_JOBLIB,
+    TEST_TOPICS_RAW_JOBLIB,
+    TOPIC_SCALER_JOBLIB,
+    ENC_TRAIN_JOBLIB,
+    ENC_TEST_JOBLIB,
+    HYBRID_MODEL_PTH,
+    HYBRID_META_JSON,
+)
+from .hybrid_model import (
+    HybridTokenDataset,
+    HybridFinModel,
+    load_tokenizer_and_backbone,
+    FocalLoss,
+)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MAX_LEN = 64
+TRAIN_BATCH = 16
+EVAL_BATCH = 32
+EPOCHS = 6
+LR_BACKBONE = 2e-5     # (not used directly; we use single optimizer)
+LR_HEAD = 1e-4
+GRU_HIDDEN = 256
+DROPOUT = 0.3
+UNFREEZE_LAST_K = 4    # how many FinBERT encoder layers to fine-tune
+
+
+def norm_texts(arr):
+    out = []
+    for x in arr:
+        s = "" if x is None else str(x).strip()
+        if s == "" or s.lower() == "nan":
+            s = "empty"
+        out.append(s)
+    return out
+
+
+def main():
+    # -------------------------------------------------
+    # Load data splits + topic features
+    # -------------------------------------------------
+    data = joblib.load(TRAIN_TEST_JOBLIB)
+    X_train, X_test = np.array(data["X_train"]), np.array(data["X_test"])
+    y_train = np.array(data["y_train"], dtype=int)
+    y_test = np.array(data["y_test"], dtype=int)
+
+    train_topics_raw = joblib.load(TRAIN_TOPICS_RAW_JOBLIB)
+    test_topics_raw = joblib.load(TEST_TOPICS_RAW_JOBLIB)
+
+    # -------------------------------------------------
+    # Topic scaler
+    # -------------------------------------------------
+    if Path(TOPIC_SCALER_JOBLIB).exists():
+        topic_scaler = joblib.load(TOPIC_SCALER_JOBLIB)
+    else:
+        topic_scaler = StandardScaler()
+        topic_scaler.fit(train_topics_raw)
+        joblib.dump(topic_scaler, TOPIC_SCALER_JOBLIB)
+
+    train_topics = topic_scaler.transform(train_topics_raw)
+    test_topics = topic_scaler.transform(test_topics_raw)
+    print("Topic shapes:", train_topics.shape, test_topics.shape)
+
+    # -------------------------------------------------
+    # Tokenizer + backbone
+    # -------------------------------------------------
+    tokenizer, backbone = load_tokenizer_and_backbone(
+        DEVICE,
+        unfreeze_last_k=UNFREEZE_LAST_K,
+    )
+
+    train_texts = norm_texts(X_train)
+    test_texts = norm_texts(X_test)
+
+    enc_train = tokenizer(
+        train_texts,
+        truncation=True,
+        padding="max_length",
+        max_length=MAX_LEN,
+        return_tensors="pt",
+    )
+    enc_test = tokenizer(
+        test_texts,
+        truncation=True,
+        padding="max_length",
+        max_length=MAX_LEN,
+        return_tensors="pt",
+    )
+
+    joblib.dump(enc_train, ENC_TRAIN_JOBLIB)
+    joblib.dump(enc_test, ENC_TEST_JOBLIB)
+
+    # -------------------------------------------------
+    # Datasets + loaders
+    # -------------------------------------------------
+    train_ds = HybridTokenDataset(enc_train, train_topics, y_train)
+    test_ds = HybridTokenDataset(enc_test, test_topics, y_test)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=TRAIN_BATCH,
+        shuffle=True,
+        pin_memory=True,
+    )
+    eval_loader = DataLoader(
+        test_ds,
+        batch_size=EVAL_BATCH,
+        shuffle=False,
+        pin_memory=True,
+    )
+
+    # -------------------------------------------------
+    # Model / optimizer / scheduler
+    # -------------------------------------------------
+    model = HybridFinModel(
+        backbone=backbone,
+        hidden_size=backbone.config.hidden_size,
+        topics_dim=train_topics.shape[1],
+        num_classes=3,
+        gru_hidden=GRU_HIDDEN,
+        dropout=DROPOUT,
+    ).to(DEVICE)
+
+    # Compute class weights dynamically from y_train
+    num_classes = 3
+    class_counts = np.bincount(y_train, minlength=num_classes).astype(float)
+    total = class_counts.sum()
+    inv_freq = total / (class_counts + 1e-9)
+    class_weights = torch.tensor(inv_freq, dtype=torch.float32, device=DEVICE)
+    class_weights = class_weights / class_weights.sum() * float(num_classes)
+    print(f"Class counts: {class_counts.tolist()} | class_weights: {class_weights.tolist()}")
+
+    # Focal Loss with class weights
+    loss_fn = FocalLoss(alpha=class_weights, gamma=2.0)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR_HEAD,
+        weight_decay=1e-4,
+    )
+    total_steps = len(train_loader) * EPOCHS
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=0,
+        num_training_steps=total_steps,
+    )
+
+    best_f1 = 0.0
+    history = {"train_loss": [], "val_acc": [], "val_f1": []}
+    t0 = time.time()
+
+    num_batches = len(train_loader)
+    print_every = max(1, num_batches // 10)
+    print(f"[TRAIN] Device={DEVICE} | epochs={EPOCHS} | batches/epoch={num_batches}")
+
+    # -------------------------------------------------
+    # Training loop
+    # -------------------------------------------------
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        loss_epoch = 0.0
+        epoch_start = time.time()
+
+        print(f"\nEpoch {epoch:02d}/{EPOCHS} — starting...")
+
+        for step, (ids, masks, topics, labels) in enumerate(train_loader, start=1):
+            ids = ids.to(DEVICE)
+            masks = masks.to(DEVICE)
+            topics = topics.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            optimizer.zero_grad()
+            logits, _ = model(ids, masks, topics)
+            loss = loss_fn(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            loss_epoch += loss.item()
+
+            if step % print_every == 0 or step == num_batches:
+                pct = 100.0 * step / num_batches
+                avg_so_far = loss_epoch / step
+                elapsed_ep = time.time() - epoch_start
+                est_total_ep = elapsed_ep / max(1e-6, step / num_batches)
+                eta_ep = est_total_ep - elapsed_ep
+
+                print(
+                    f"  [Epoch {epoch:02d}/{EPOCHS}] "
+                    f"batch {step:4d}/{num_batches} "
+                    f"({pct:5.1f}%) | batch_loss={loss.item():.4f} "
+                    f"| avg_loss={avg_so_far:.4f} "
+                    f"| elapsed={elapsed_ep:5.1f}s "
+                    f"| eta={max(0.0, eta_ep):5.1f}s",
+                    end="\r",
+                    flush=True,
+                )
+        print()  # newline after last progress
+
+        avg_loss = loss_epoch / max(1, len(train_loader))
+        history["train_loss"].append(avg_loss)
+
+        # -------------------------------------------------
+        # Evaluation
+        # -------------------------------------------------
+        model.eval()
+        preds, lbls = [], []
+        with torch.no_grad():
+            for ids, masks, topics, labels in eval_loader:
+                ids = ids.to(DEVICE)
+                masks = masks.to(DEVICE)
+                topics = topics.to(DEVICE)
+                out, _ = model(ids, masks, topics)
+                preds.extend(out.argmax(dim=1).cpu().numpy())
+                lbls.extend(labels.numpy())
+
+        f1m = f1_score(lbls, preds, average="macro")
+        acc = accuracy_score(lbls, preds)
+        history["val_acc"].append(acc)
+        history["val_f1"].append(f1m)
+
+        epoch_time = time.time() - epoch_start
+        print(
+            f"Epoch {epoch:02d} | loss={avg_loss:.4f} "
+            f"| acc={acc:.4f} | F1={f1m:.4f} "
+            f"| epoch_time={epoch_time:.1f}s"
+        )
+
+        if f1m > best_f1:
+            best_f1 = f1m
+            torch.save(model.state_dict(), HYBRID_MODEL_PTH)
+            print(f"→ Saved new best model (F1={best_f1:.4f})")
+
+    total_time = time.time() - t0
+    print(f"\nTraining finished in {total_time:.1f}s | best F1={best_f1:.4f}")
+
+    # -------------------------------------------------
+    # Final report (reload best weights) + SAVE METRICS
+    # -------------------------------------------------
+    model.load_state_dict(torch.load(HYBRID_MODEL_PTH, map_location=DEVICE))
+    model.eval()
+    preds, lbls = [], []
+    with torch.no_grad():
+        for ids, masks, topics, labels in eval_loader:
+            ids = ids.to(DEVICE)
+            masks = masks.to(DEVICE)
+            topics = topics.to(DEVICE)
+            out, _ = model(ids, masks, topics)
+            preds.extend(out.argmax(dim=1).cpu().numpy())
+            lbls.extend(labels.numpy())
+
+    lbls = np.array(lbls, dtype=int)
+    preds = np.array(preds, dtype=int)
+
+    # Overall metrics
+    final_acc = accuracy_score(lbls, preds)
+    final_f1m = f1_score(lbls, preds, average="macro")
+    report = classification_report(
+        lbls,
+        preds,
+        target_names=["Negative", "Neutral", "Positive"],
+        digits=4,
+    )
+    cm = confusion_matrix(lbls, preds, labels=[0, 1, 2])
+
+    print("\nFinal classification report:")
+    print(report)
+    print("\nConfusion matrix (rows=true, cols=pred):\n", cm)
+
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ---- Save classification report as TXT ----
+    report_path = ARTIFACTS_DIR / "hybrid_classification_report.txt"
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    print(f"Saved classification report to {report_path}")
+
+    # ---- Save confusion matrix as CSV + PNG ----
+    cm_df = pd.DataFrame(
+        cm,
+        index=["Negative", "Neutral", "Positive"],
+        columns=["Negative", "Neutral", "Positive"],
+    )
+    cm_csv_path = ARTIFACTS_DIR / "cm_hybrid_final.csv"
+    cm_df.to_csv(cm_csv_path)
+    print(f"Saved confusion matrix CSV to {cm_csv_path}")
+
+    cm_png_path = ARTIFACTS_DIR / "cm_hybrid_final.png"
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=["Negative", "Neutral", "Positive"],
+        yticklabels=["Negative", "Neutral", "Positive"],
+    )
+    plt.title("Hybrid model — Confusion Matrix (test set)")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.tight_layout()
+    plt.savefig(cm_png_path)
+    plt.close()
+    print(f"Saved confusion matrix PNG to {cm_png_path}")
+
+    # ---- Save meta JSON including metrics ----
+    meta = {
+        "device": str(DEVICE),
+        "max_len": MAX_LEN,
+        "epochs": EPOCHS,
+        "best_f1_macro": float(best_f1),
+        "final_test_acc": float(final_acc),
+        "final_test_f1_macro": float(final_f1m),
+        "train_batches_per_epoch": num_batches,
+        "train_batch_size": TRAIN_BATCH,
+        "eval_batch_size": EVAL_BATCH,
+        "total_train_time_sec": float(total_time),
+        "gru_hidden": GRU_HIDDEN,
+        "dropout": DROPOUT,
+        "unfreeze_last_k": UNFREEZE_LAST_K,
+    }
+    with open(HYBRID_META_JSON, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    print(f"Saved meta (with metrics) to {HYBRID_META_JSON}")
+
+
+if __name__ == "__main__":
+    main()
